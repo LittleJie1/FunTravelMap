@@ -85,7 +85,6 @@ def handle_follow(event):
             u = {
                 "_id": userid,
                 "display_name": profile.display_name,
-                "user_id": profile.user_id,
                 "picture_url": profile.picture_url,
                 "status_message": profile.status_message,
                 "language": profile.language,
@@ -108,20 +107,26 @@ def handle_unfollow(event):
         {"$set": {"unfollow": strftime('%Y/%m/%d-%H:%M:%S')}}
     )
 
-@app.route('/get_itineraries', methods=['GET']) #讀取現有行程
+@app.route('/get_itineraries', methods=['POST']) #-------------------------查看行程
 def get_itineraries():
-    user_id = request.args.get('user_id')
+    user_id = request.json.get('user_id')
     
-    # 查找指定用戶的資料
-    user = users.find_one({"_id": user_id})
-    if not user:
-        return jsonify({'status': 'error', 'message': 'User not found'}), 404
+    if not user_id:
+        return jsonify({'status': 'error', 'message': '需要提供使用者ID'}), 400
 
-    # 獲取用戶的行程列表
-    itineraries = user.get('itineraries', [])
-    return jsonify({'status': 'success', 'itineraries': itineraries})
+    try:
+        user = users.find_one({"_id": user_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到使用者'}), 404
 
-@app.route('/add_itinerary', methods=['POST']) #新建行程
+        itineraries = user.get('itineraries', [])
+        return jsonify({'status': 'success', 'itineraries': itineraries})
+    except Exception as e:
+        print(f'獲取使用者行程時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'獲取使用者行程時發生錯誤: {str(e)}'}), 500
+
+
+@app.route('/add_itinerary', methods=['POST']) #-------------------------新建行程
 def add_itinerary():
     data = request.json
     user_id = data.get('user_id')
@@ -141,6 +146,53 @@ def add_itinerary():
         return jsonify({'status': 'success'})
     else:
         return jsonify({'status': 'error', 'message': 'Failed to add itinerary'}), 500
+    
+@app.route('/delete_itinerary', methods=['POST']) #--------------------刪除行程
+def delete_itinerary():
+    user_id = request.json.get('user_id')
+    itinerary_id = request.json.get('itinerary_id')
+    print(f"接收到的 user_id: {user_id}, itinerary_id: {itinerary_id}")
+
+    if not user_id or not itinerary_id:
+        return jsonify({'status': 'error', 'message': '需要提供使用者ID和行程ID'}), 400
+
+    try:
+        user = users.find_one({"_id": user_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到使用者'}), 404
+
+        # 找到並刪除對應的行程
+        updated_itineraries = [it for it in user.get('itineraries', []) if it['itinerary_id'] != itinerary_id]
+        users.update_one({"_id": user_id}, {"$set": {"itineraries": updated_itineraries}})
+        return jsonify({'status': 'success', 'message': '行程已刪除'})
+    except Exception as e:
+        print(f'刪除行程時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'刪除行程時發生錯誤: {str(e)}'}), 500
+    
+@app.route('/add_place', methods=['POST']) # --------------------加入行程
+def add_place():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+    place = data.get('place')
+
+    if not itinerary_id or not place:
+        return jsonify({'status': 'error', 'message': '缺少行程ID或地點信息'}), 400
+
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+        # 使用更新操作符将新地点添加到 places 数组中
+        users.update_one(
+            {"itineraries.itinerary_id": itinerary_id},
+            {"$push": {"itineraries.$.places": place}}
+        )
+
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        print(f'添加地点时发生错误: {e}')
+        return jsonify({'status': 'error', 'message': f'添加地点时发生错误: {str(e)}'}), 500
 
 @app.route('/route/<user_id>/<itinerary_id>', methods=['GET'])  #最佳路線規劃
 def route(user_id, itinerary_id):
