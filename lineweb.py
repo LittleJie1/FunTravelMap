@@ -26,18 +26,24 @@ from linebot.v3.webhooks import (
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# 讀取環境變數
 with open('env.json') as f:
     env = json.load(f)
+
 configuration = Configuration(access_token=env['CHANNEL_ACCESS_TOKEN'])
 handler = WebhookHandler(env['CHANNEL_SECRET'])
 
+# 設置 MongoDB 連接
 uri = "mongodb+srv://jiejieupup:1qaz2wsx@funtravelmap.nw4tnce.mongodb.net/?retryWrites=true&w=majority&appName=funtravelmap&tls=true&tlsAllowInvalidCertificates=true"
 mongo_client = MongoClient(uri)
+
 try:
     mongo_client.admin.command('ping')
     print("Pinged your deployment. You successfully connected to MongoDB!")
 except Exception as e:
     print(e)
+
 db = mongo_client['web']
 users = db['travel']
 
@@ -126,15 +132,32 @@ def get_itineraries():
         return jsonify({'status': 'error', 'message': f'獲取使用者行程時發生錯誤: {str(e)}'}), 500
 
 
-@app.route('/add_itinerary', methods=['POST']) #-------------------------新建行程
+@app.route('/add_itinerary', methods=['POST'])  # -------------------------新建行程
 def add_itinerary():
     data = request.json
     user_id = data.get('user_id')
     itinerary = data.get('itinerary')
+    itinerary_id = itinerary.get('itinerary_id')
+    itinerary_name = itinerary.get('name')
+    days = itinerary.get('days')
 
-    # 打印收到的数据以便调试
-    print(f"Received itinerary: {itinerary} for user: {user_id}")
-
+    # 檢查必要的字段是否存在
+    if not all([user_id, itinerary_id, itinerary_name, days]):
+        print("Missing required fields")
+        return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+    # 確保 days 是整數
+    try:
+        days = int(days)
+    except ValueError:
+        print("Invalid days value")
+        return jsonify({'status': 'error', 'message': 'Invalid days value'}), 400
+    # 初始化行程，每天的景點列表为空
+    itinerary = {
+        "itinerary_id": itinerary_id,
+        "name": itinerary_name,
+        "days": days,
+        "places": [[] for _ in range(days)]
+    }
     # 更新用戶的行程列表，添加新的行程
     result = users.update_one(
         {"_id": user_id},
@@ -169,30 +192,95 @@ def delete_itinerary():
         print(f'刪除行程時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'刪除行程時發生錯誤: {str(e)}'}), 500
     
-@app.route('/add_place', methods=['POST']) # --------------------加入行程
+@app.route('/add_place', methods=['POST'])  # --------------------加入行程
 def add_place():
     data = request.json
     itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
     place = data.get('place')
+    if not itinerary_id or day_index is None or not place:
+        return jsonify({'status': 'error', 'message': '缺少行程ID或地點信息或天數索引'}), 400
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+        # 查找具體的行程
+        itinerary = None
+        for it in user['itineraries']:
+            if it['itinerary_id'] == itinerary_id:
+                itinerary = it
+                break
+        if not itinerary:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+        # 確保 'places' 是一個包含多個子數組的列表，每個子數組代表一天的行程
+        if not isinstance(itinerary['places'], list):
+            itinerary['places'] = []
 
-    if not itinerary_id or not place:
-        return jsonify({'status': 'error', 'message': '缺少行程ID或地點信息'}), 400
+        # 初始化每一天的行程為一個列表
+        while len(itinerary['places']) <= day_index:
+            itinerary['places'].append([])
+
+        # 將新的地點添加到指定的天數
+        itinerary['places'][day_index].append(place)
+
+        # 更新 MongoDB 中的用戶文檔
+        users.update_one(
+            {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+            {"$set": {"itineraries.$.places": itinerary['places']}}
+        )
+        return jsonify({'status': 'success'}), 200
+
+    except Exception as e:
+        print(f'添加地點時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'添加地點時發生錯誤: {str(e)}'}), 500
+    
+@app.route('/remove_day', methods=['POST']) # --------------------減天數
+def remove_day():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+
+    if not itinerary_id:
+        return jsonify({'status': 'error', 'message': '缺少行程ID'}), 400
 
     try:
         user = users.find_one({"itineraries.itinerary_id": itinerary_id})
         if not user:
             return jsonify({'status': 'error', 'message': '找不到行程'}), 404
 
-        # 使用更新操作符将新地点添加到 places 数组中
+        itinerary = next(it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id)
+        if itinerary['days'] <= 1:
+            return jsonify({'status': 'error', 'message': '行程天數不能少於1天'}), 400
+
         users.update_one(
             {"itineraries.itinerary_id": itinerary_id},
-            {"$push": {"itineraries.$.places": place}}
+            {"$inc": {"itineraries.$.days": -1}, "$pop": {"itineraries.$.places": 1}}
         )
-
         return jsonify({'status': 'success'}), 200
     except Exception as e:
-        print(f'添加地点时发生错误: {e}')
-        return jsonify({'status': 'error', 'message': f'添加地点时发生错误: {str(e)}'}), 500
+        print(f'刪除天數時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'刪除天數時發生錯誤: {str(e)}'}), 500
+    
+@app.route('/add_day', methods=['POST']) # --------------------加天數
+def add_day():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+
+    if not itinerary_id:
+        return jsonify({'status': 'error', 'message': '缺少行程ID'}), 400
+
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+        users.update_one(
+            {"itineraries.itinerary_id": itinerary_id},
+            {"$inc": {"itineraries.$.days": 1}, "$push": {"itineraries.$.places": []}}
+        )
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        print(f'添加天數時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'添加天數時發生錯誤: {str(e)}'}), 500
 
 @app.route('/route/<user_id>/<itinerary_id>', methods=['GET'])  #最佳路線規劃
 def route(user_id, itinerary_id):
