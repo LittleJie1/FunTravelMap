@@ -3,7 +3,8 @@ from flask_cors import CORS
 import json
 from time import strftime
 from pymongo.mongo_client import MongoClient
-import requests
+import itertools
+import requests  
 from linebot.v3 import (
     WebhookHandler
 )
@@ -260,7 +261,7 @@ def remove_day():
         print(f'刪除天數時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'刪除天數時發生錯誤: {str(e)}'}), 500
     
-@app.route('/add_day', methods=['POST']) # --------------------加天數
+@app.route('/add_day', methods=['POST']) # ------------------------加天數
 def add_day():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -282,64 +283,182 @@ def add_day():
         print(f'添加天數時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'添加天數時發生錯誤: {str(e)}'}), 500
 
-@app.route('/route/<user_id>/<itinerary_id>', methods=['GET'])  #最佳路線規劃
-def route(user_id, itinerary_id):
-    # 從 MongoDB 中獲取用戶資料
-    user = users.find_one({"_id": user_id})
+@app.route('/move_place', methods=['POST'])  # --------------------移動景點順序
+def move_place():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
+    place_index = data.get('place_index')
+    direction = data.get('direction')
+
+    if not all([itinerary_id, day_index is not None, place_index is not None, direction]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+        itinerary = next(it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id)
+        places = itinerary['places'][day_index]
+
+        if direction == 'up' and place_index > 0:
+            places.insert(place_index - 1, places.pop(place_index))
+        elif direction == 'down' and place_index < len(places) - 1:
+            places.insert(place_index + 1, places.pop(place_index))
+        else:
+            return jsonify({'status': 'error', 'message': '移動方向無效或位置錯誤'}), 400
+
+        users.update_one(
+            {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+            {"$set": {"itineraries.$.places": itinerary['places']}}
+        )
+        return jsonify({'status': 'success'}), 200
+
+    except Exception as e:
+        print(f'移動地點時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'移動地點時發生錯誤: {str(e)}'}), 500
+
+@app.route('/delete_place', methods=['POST'])  # --------------------移動景點順序
+def delete_place():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
+    place_index = data.get('place_index')
+
+    if not all([itinerary_id, day_index is not None, place_index is not None]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+        itinerary = next(it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id)
+        places = itinerary['places'][day_index]
+
+        if place_index < 0 or place_index >= len(places):
+            return jsonify({'status': 'error', 'message': '地點索引無效'}), 400
+
+        places.pop(place_index)
+
+        users.update_one(
+            {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+            {"$set": {"itineraries.$.places": itinerary['places']}}
+        )
+        return jsonify({'status': 'success'}), 200
+
+    except Exception as e:
+        print(f'刪除地點時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'刪除地點時發生錯誤: {str(e)}'}), 500
+    
+ 
+@app.route('/optimize_route', methods=['POST']) # ------------------------------------------實現最短路徑按鈕
+def optimize_route():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
+
+    if not all([itinerary_id, day_index is not None]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    user = users.find_one({"itineraries.itinerary_id": itinerary_id})
     if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    # 從用戶資料中獲取指定的行程
-    itinerary = next((it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id), None)
-    if not itinerary:
-        return jsonify({'error': 'Itinerary not found'}), 404
+        return jsonify({'status': 'error', 'message': '找不到行程'}), 404
 
-    # 獲取行程中的景點列表
-    places = itinerary['places']
+    itinerary = next(it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id)
+    places = itinerary['places'][day_index]
+
     if len(places) < 2:
-        return jsonify({'error': 'At least two places are required.'}), 400
+        return jsonify({'status': 'error', 'message': '地點數量不足'}), 400
 
-    # 起點為景點列表中的第一個
-    origin = places[0]
-    # 終點為景點列表中的最後一個
-    destination = places[-1]
-    # 途經點為介於起點和終點之間的景點
-    waypoints = places[1:-1]
+    origins = '|'.join([f"{place['latitude']},{place['longitude']}" for place in places])
 
-    # 構建 Google Maps Directions API 請求
-    url = 'https://maps.googleapis.com/maps/api/directions/json'
-    params = {
-        'origin': f'{origin["latitude"]},{origin["longitude"]}',  # 起點經緯度
-        'destination': f'{destination["latitude"]},{destination["longitude"]}',  # 終點經緯度
-        'waypoints': '|'.join([f'{wp["latitude"]},{wp["longitude"]}' for wp in waypoints]),  # 途經點經緯度
-        'key': GOOGLE_MAPS_API_KEY,  # Google Maps API 金鑰
-        'optimizeWaypoints': 'true'  # 優化途經點順序
-    }
+    try:
+        response_data = calculate_distance_matrix(origins)
+        if response_data['status'] != 'OK':
+            return jsonify({'status': 'error', 'message': 'Google API錯誤'}), 500
 
-    # 發送請求到 Google Maps Directions API
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
-        return jsonify({'error': 'Failed to get directions from Google Maps API.'}), 500
+        distances = [[element['distance']['value'] for element in row['elements']] for row in response_data['rows']]
+        sorted_places = find_best_route(distances, places)
 
-    # 解析 API 返回的結果
-    directions = response.json()
-    if directions['status'] != 'OK':
-        return jsonify({'error': 'No route found.'}), 404
+        # 更新 MongoDB 中的行程順序
+        users.update_one(
+            {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+            {"$set": {f"itineraries.$.places.{day_index}": sorted_places}}
+        )
+        return jsonify({'status': 'success', 'route': sorted_places}), 200
 
-    # 提取最佳路線順序
-    waypoint_order = directions['routes'][0]['waypoint_order']
+    except Exception as e:
+        print(f'優化路徑時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'優化路徑時發生錯誤: {str(e)}'}), 500
     
-    # 根據返回的順序重排景點列表
-    optimized_places = [origin] + [waypoints[i] for i in waypoint_order] + [destination]
-    
-    # 更新 MongoDB 中的行程資料
-    users.update_one(
-        {"_id": user_id, "itineraries.itinerary_id": itinerary_id},
-        {"$set": {"itineraries.$.places": optimized_places}}
-    )
+def calculate_distance_matrix(origins): #-----------------------------------計算景點之間距離矩陣
+    url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins}&destinations={origins}&key={GOOGLE_MAPS_API_KEY}"
+    response = requests.get(url)
+    response_data = response.json()
+    return response_data
 
-    # 返回最佳路線信息
-    return jsonify(directions['routes'][0])
+def find_best_route(distances, places): #-----------------------------------計算查找最佳路線
+    num_places = len(places)  # 獲取地點數量
+    indices = list(range(num_places))  # 創建一個地點索引的列表 [0, 1, 2, ...]
+    min_distance = float('inf')  # 初始化最小距離為正無窮大
+    best_permutation = indices  # 初始化最佳排列為地點的原始順序
+    cache = {}  # 初始化一個字典用來緩存計算過的排列組合的總距離
+
+    def calculate_total_distance(permutation):
+        # 如果該排列組合的距離已經計算過，直接從緩存中獲取
+        if permutation in cache:
+            return cache[permutation]
+        
+        # 計算該排列組合的總距離
+        total_distance = sum(distances[permutation[i]][permutation[i+1]] for i in range(len(permutation) - 1))
+        
+        # 將計算結果存入緩存中
+        cache[permutation] = total_distance
+        return total_distance
+
+    # 遍歷所有地點的所有排列組合
+    for permutation in itertools.permutations(indices):
+        total_distance = calculate_total_distance(permutation)  # 計算當前排列的總距離
+        
+        # 如果當前排列的總距離小於已知最小距離，則更新最小距離和最佳排列
+        if total_distance < min_distance:
+            min_distance = total_distance
+            best_permutation = permutation
+
+    # 根據最佳排列重新排序地點
+    sorted_places = [places[i] for i in best_permutation]
+    return sorted_places
+
+@app.route('/update_place_order', methods=['POST'])# ------------------------------------------拖曳方式移動景點順序
+def update_place_order():
+    data = request.json
+    itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
+    places = data.get('places')
+
+    if not all([itinerary_id, day_index is not None, places]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    try:
+        user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+        if not user:
+            return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+        itinerary = next(it for it in user['itineraries'] if it['itinerary_id'] == itinerary_id)
+        itinerary['places'][day_index] = places
+
+        users.update_one(
+            {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+            {"$set": {f"itineraries.$.places.{day_index}": places}}
+        )
+        return jsonify({'status': 'success'}), 200
+
+    except Exception as e:
+        print(f'更新地點順序時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'更新地點順序時發生錯誤: {str(e)}'}), 500
+
 
 if __name__ == '__main__':
     app.run()
