@@ -5,6 +5,9 @@ from time import strftime
 from pymongo.mongo_client import MongoClient
 import itertools
 import requests  
+import uuid
+import pytz
+from datetime import datetime
 from linebot.v3 import (
     WebhookHandler
 )
@@ -47,7 +50,8 @@ except Exception as e:
 
 db = mongo_client['web']
 users = db['travel']
-
+db2 = mongo_client['funtravelmap']
+checkins_collection = db2['checkins']
 GOOGLE_MAPS_API_KEY = env['GOOGLE_MAPS_API_KEY']
 
 @app.route("/callback", methods=['POST'])
@@ -458,7 +462,100 @@ def update_place_order():
     except Exception as e:
         print(f'更新地點順序時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'更新地點順序時發生錯誤: {str(e)}'}), 500
+@app.route('/checkin', methods=['POST'])#1
+def checkin():
+    data = request.get_json()
+    latitude = data.get('latitude')
+    longitude = data.get('longitude')
+    timestamp = data.get('timestamp')
+    user_profile = data.get('userProfile')
+    checkin_name = data.get('checkinName', '未命名')  # 預設為“未命名”
 
+    print('Received check-in data:', data)
+
+    if not all([latitude, longitude, timestamp, user_profile]):
+        return jsonify({"error": "Missing data"}), 400
+
+    checkin_id = str(uuid.uuid4())  # 生成唯一的 checkinId
+    utc_time = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%fZ')
+    local_tz = pytz.timezone('Asia/Taipei')
+    local_time = utc_time.replace(tzinfo=pytz.utc).astimezone(local_tz)
+    local_time_str = local_time.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+
+    checkin_record = {
+        "checkinId": checkin_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp": local_time_str,
+        "checkinName": checkin_name  # 增加 checkinName 字段
+    }
+
+    try:
+        checkins_collection.update_one(
+            {"_id": user_profile["userId"]},
+            {
+                "$set": {
+                    "displayName": user_profile["displayName"],
+                    "pictureUrl": user_profile["pictureUrl"]
+                },
+                "$push": {
+                    "checkins": checkin_record
+                }
+            },
+            upsert=True
+        )
+        print('Check-in data saved to MongoDB')
+        return jsonify({"checkinId": checkin_id}), 200  # 返回 checkinId
+    except Exception as e:
+        print('Error inserting data into MongoDB:', e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/fetch_checkins', methods=['POST'])#2
+def fetch_checkins():
+    try:
+        checkins = list(checkins_collection.find({}, {'_id': 0}))
+        print('Checkins data:', checkins)
+        return jsonify(checkins), 200
+    except Exception as e:
+        print('Error fetching check-ins:', e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/checkins', methods=['DELETE'])#3
+def delete_checkins():
+    try:
+        result = checkins_collection.delete_many({})
+        if result.deleted_count > 0:
+            return jsonify({"message": "All check-ins deleted successfully"}), 200
+        else:
+            return jsonify({"error": "No check-ins found to delete"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/checkin/<checkin_id>', methods=['POST'])  # 確保允許 POST 方法#4
+def get_checkin(checkin_id):
+    try:
+        # 根據 checkin_id 查找打卡記錄
+        user_checkin = checkins_collection.find_one({'checkins.checkinId': checkin_id}, {'checkins.$': 1})
+        if user_checkin and 'checkins' in user_checkin and user_checkin['checkins']:
+            checkin = user_checkin['checkins'][0]
+            return jsonify(checkin), 200
+        else:
+            return jsonify({'error': 'Checkin not found'}), 404
+    except Exception as e:
+        app.logger.error('Error fetching check-in details: %s', e)
+        return jsonify({'error': str(e)}), 500
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=event.message.text)]
+            )
+        )
 
 if __name__ == '__main__':
     app.run()
