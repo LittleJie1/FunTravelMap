@@ -7,6 +7,10 @@ import itertools
 import requests  
 import uuid
 import pytz
+import googlemaps
+import os
+from vertexai.preview.generative_models import GenerativeModel
+import time
 from datetime import datetime
 from linebot.v3 import (
     WebhookHandler
@@ -53,6 +57,21 @@ users = db['travel']
 db2 = mongo_client['funtravelmap']
 checkins_collection = db2['checkins']
 GOOGLE_MAPS_API_KEY = env['GOOGLE_MAPS_API_KEY']
+
+# Google Maps API 金鑰
+API_KEY = GOOGLE_MAPS_API_KEY
+# 初始化 googlemaps 客戶端
+gmaps = googlemaps.Client(key=API_KEY)
+# 設置Google Application Credentials環境變量
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'teamwork.json'
+# 初始化Gemini模型
+model = GenerativeModel("gemini-1.5-pro-preview-0409")
+# 設定生成配置
+generation_config = {
+    "temperature": 1,
+    "top_k": 40,
+    "top_p": 0.9
+}
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -383,7 +402,7 @@ def optimize_route():
         if response_data['status'] != 'OK':
             return jsonify({'status': 'error', 'message': 'Google API錯誤'}), 500
 
-        distances = [[element['distance']['value'] for element in row['elements']] for row in response_data['rows']]
+        distances = extract_distances(response_data)
         sorted_places = find_best_route(distances, places)
 
         # 更新 MongoDB 中的行程順序
@@ -402,6 +421,12 @@ def calculate_distance_matrix(origins): #-----------------------------------計�
     response = requests.get(url)
     response_data = response.json()
     return response_data
+
+def extract_distances(response_data): #-----------------------------------提取距離矩陣
+    distances = []
+    for row in response_data['rows']:
+        distances.append([element['distance']['value'] for element in row['elements']])
+    return distances
 
 def find_best_route(distances, places): #-----------------------------------計算查找最佳路線
     num_places = len(places)  # 獲取地點數量
@@ -442,7 +467,8 @@ def update_place_order():
     day_index = data.get('day_index')
     places = data.get('places')
 
-    if not all([itinerary_id, day_index is not None, places]):
+    # 修改檢查邏輯，允許 places 為空數組
+    if not all([itinerary_id, day_index is not None]):
         return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
 
     try:
@@ -462,6 +488,129 @@ def update_place_order():
     except Exception as e:
         print(f'更新地點順序時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'更新地點順序時發生錯誤: {str(e)}'}), 500
+    
+@app.route('/process_city_selection', methods=['POST'])# ------------------------------------------智能推薦景點
+def process_city_selection():
+    data = request.json
+    city_name = data.get('city_name')
+    itinerary_id = data.get('itinerary_id')
+    day_index = data.get('day_index')
+
+    if not all([city_name, itinerary_id, day_index is not None]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    try:
+        # 查詢指定縣市的景點
+        print("查詢指定縣市的景點")
+        places = get_places_by_city(city_name, place_type='tourist_attraction')
+        high_rated_places = filter_high_rated_places(places)
+        print(f"查詢結果: {len(high_rated_places)} 個高評價景點")
+
+        # 收集成 JSON 格式
+        places_list = []
+        for place in high_rated_places:
+            place_info = {
+                "place_id": place['place_id'],
+                "name": place['name'],
+                "latitude": place['geometry']['location']['lat'],
+                "longitude": place['geometry']['location']['lng'],
+                "address": place.get('formatted_address', place.get('vicinity', '')),
+                "visited": False
+            }
+            places_list.append(place_info)
+
+        places_json = json.dumps(places_list, ensure_ascii=False, indent=4)
+        
+        # 調用 Gemini API
+        print("調用 Gemini API")
+        prompt = '''
+        請依據我給你JSON景點內容，依照我給你的條件回覆我
+        1. 從JSON裡面隨便挑選出五個，不可以從前面開始選，一定要依照我給的資料中隨機選取
+        2. 如果name有顯示單獨縣市名稱、停車場相關，廁所相關都不列入你的選項
+        3. 請勿回復其他訊息
+        4. 以我傳給你的JSON樣式保持原樣，回覆我你排的順序就好，每次都可以不一樣
+        '''
+        prompt += places_json
+        r = model.generate_content(
+            [prompt],
+            generation_config=generation_config
+        )
+
+        # 確保回應為有效的 JSON
+        print("處理 Gemini 回應")
+        if isinstance(r.text, str):
+            try:
+                gemini_response = json.loads(r.text.strip())
+            except json.JSONDecodeError:
+                return jsonify({'status': 'error', 'message': 'Gemini 回應無效的 JSON'}), 500
+            
+            # 調用最佳路線計算
+            print("調用最佳路線計算")
+            origins = '|'.join([f"{place['latitude']},{place['longitude']}" for place in gemini_response])
+            response_data = calculate_distance_matrix(origins)
+            if response_data['status'] != 'OK':
+                print(f"Google API 錯誤: {response_data['status']}")
+                return jsonify({'status': 'error', 'message': 'Google API錯誤'}), 500
+
+            distances = extract_distances(response_data)
+            sorted_places = find_best_route(distances, gemini_response)
+            print(f"最佳路線計算結果: {sorted_places}")
+            
+            # 更新 MongoDB
+            print("更新 MongoDB")
+            user = users.find_one({"itineraries.itinerary_id": itinerary_id})
+            if not user:
+                print("找不到行程")
+                return jsonify({'status': 'error', 'message': '找不到行程'}), 404
+
+            users.update_one(
+                {"_id": user['_id'], "itineraries.itinerary_id": itinerary_id},
+                {"$set": {f"itineraries.$.places.{day_index}": sorted_places}}
+            )
+            print("更新 MongoDB 成功")
+
+            return jsonify({'status': 'success', 'places': sorted_places}), 200
+
+        else:
+            return jsonify({'status': 'error', 'message': 'Gemini API 回應格式錯誤'}), 500
+
+    except Exception as e:
+        print(f'處理縣市選擇時發生錯誤: {e}')
+        return jsonify({'status': 'error', 'message': f'處理縣市選擇時發生錯誤: {str(e)}'}), 500
+    
+# 查詢函數
+def get_places_by_city(city_name, place_type='tourist_attraction', language='zh-TW', max_places=30):
+    try:
+        query = f'{place_type} in {city_name}'
+        places_result = gmaps.places(query=query, language=language)
+        places = places_result['results']
+        total_places = len(places)
+        
+        while 'next_page_token' in places_result and total_places < max_places:
+            next_page_token = places_result['next_page_token']
+            time.sleep(2)
+            places_result = gmaps.places(query=query, language=language, page_token=next_page_token)
+            places.extend(places_result['results'])
+            total_places = len(places)
+            if total_places >= max_places:
+                places = places[:max_places]
+                break
+        
+        return places
+    
+    except Exception as e:
+        print(f"Error in get_places_by_city: {e}")
+        return []
+
+# 過濾函數
+def filter_high_rated_places(places, min_rating=4.0):
+    try:
+        high_rated_places = [place for place in places if place.get('rating', 0) >= min_rating]
+        return high_rated_places
+    except Exception as e:
+        print(f"Error in filter_high_rated_places: {e}")
+        return []
+# ------------------------------------------------------------------------------ raman part
 @app.route('/checkin', methods=['POST'])#1
 def checkin():
     data = request.get_json()
@@ -556,6 +705,7 @@ def handle_message(event):
                 messages=[TextMessage(text=event.message.text)]
             )
         )
+# ------------------------------------------------------------------------------ raman part
 
 if __name__ == '__main__':
     app.run()
