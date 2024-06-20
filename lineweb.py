@@ -506,10 +506,9 @@ def process_city_selection():
         high_rated_places = filter_high_rated_places(places)
         print(f"查詢結果: {len(high_rated_places)} 個高評價景點")
 
-        # 收集成 JSON 格式
-        places_list = []
-        for place in high_rated_places:
-            place_info = {
+        # 準備景點信息列表
+        places_list = [
+            {
                 "place_id": place['place_id'],
                 "name": place['name'],
                 "latitude": place['geometry']['location']['lat'],
@@ -517,10 +516,9 @@ def process_city_selection():
                 "address": place.get('formatted_address', place.get('vicinity', '')),
                 "visited": False
             }
-            places_list.append(place_info)
+            for place in high_rated_places
+        ]
 
-        places_json = json.dumps(places_list, ensure_ascii=False, indent=4)
-        
         # 調用 Gemini API
         print("調用 Gemini API")
         prompt = '''
@@ -530,7 +528,7 @@ def process_city_selection():
         3. 請勿回復其他訊息
         4. 以我傳給你的JSON樣式保持原樣，回覆我你排的順序就好，每次都可以不一樣
         '''
-        prompt += places_json
+        prompt += json.dumps(places_list, ensure_ascii=False, indent=4)
         r = model.generate_content(
             [prompt],
             generation_config=generation_config
@@ -543,7 +541,7 @@ def process_city_selection():
                 gemini_response = json.loads(r.text.strip())
             except json.JSONDecodeError:
                 return jsonify({'status': 'error', 'message': 'Gemini 回應無效的 JSON'}), 500
-            
+
             # 調用最佳路線計算
             print("調用最佳路線計算")
             origins = '|'.join([f"{place['latitude']},{place['longitude']}" for place in gemini_response])
@@ -555,7 +553,7 @@ def process_city_selection():
             distances = extract_distances(response_data)
             sorted_places = find_best_route(distances, gemini_response)
             print(f"最佳路線計算結果: {sorted_places}")
-            
+
             # 更新 MongoDB
             print("更新 MongoDB")
             user = users.find_one({"itineraries.itinerary_id": itinerary_id})
