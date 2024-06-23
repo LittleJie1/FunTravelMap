@@ -9,6 +9,8 @@ import uuid
 import pytz
 import googlemaps
 import os
+from geopy.distance import geodesic
+from google.cloud import storage
 from vertexai.preview.generative_models import GenerativeModel
 import time
 from datetime import datetime
@@ -43,8 +45,7 @@ configuration = Configuration(access_token=env['CHANNEL_ACCESS_TOKEN'])
 handler = WebhookHandler(env['CHANNEL_SECRET'])
 
 # 設置 MongoDB 連接
-uri = "mongodb+srv://jiejieupup:1qaz2wsx@funtravelmap.nw4tnce.mongodb.net/?retryWrites=true&w=majority&appName=funtravelmap&tls=true&tlsAllowInvalidCertificates=true"
-mongo_client = MongoClient(uri)
+mongo_client = MongoClient(env['MONGODB_URI'])
 
 try:
     mongo_client.admin.command('ping')
@@ -54,8 +55,6 @@ except Exception as e:
 
 db = mongo_client['web']
 users = db['travel']
-db2 = mongo_client['funtravelmap']
-checkins_collection = db2['checkins']
 GOOGLE_MAPS_API_KEY = env['GOOGLE_MAPS_API_KEY']
 
 # Google Maps API 金鑰
@@ -72,6 +71,12 @@ generation_config = {
     "top_k": 40,
     "top_p": 0.9
 }
+
+# 設置Google Cloud Storage客戶端
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcs-key.json"
+gcs_client = storage.Client()
+bucket_name = 'funtravelmap' # 你的存儲桶名稱
+bucket = gcs_client.bucket(bucket_name)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -97,8 +102,7 @@ def handle_message(event):
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=event.message.text)]
+                
             )
         )
 
@@ -609,21 +613,54 @@ def filter_high_rated_places(places, min_rating=4.0):
         print(f"Error in filter_high_rated_places: {e}")
         return []
 # ------------------------------------------------------------------------------ raman part
-@app.route('/checkin', methods=['POST'])#1
+def is_nearby(place_lat, place_lng, checkin_lat, checkin_lng, distance_km=1):
+    place_coords = (place_lat, place_lng)
+    checkin_coords = (checkin_lat, checkin_lng)
+    return geodesic(place_coords, checkin_coords).km <= distance_km
+
+# 添加在 checkin 函數之前，定義一個函數，用於檢查用戶是否已經在某個地點打卡
+@app.route('/check_nearby_places', methods=['POST'])
+def check_nearby_places():
+    data = request.get_json()
+    latitude = data.get('latitude')
+    longitude = data.get('longitude')
+    user_profile = data.get('userProfile')
+
+    if not all([latitude, longitude, user_profile]):
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        user = users.find_one({"_id": user_profile["userId"]})
+        if not user or 'itineraries' not in user:
+            return jsonify([]), 200
+
+        nearby_places = []
+        for itinerary in user['itineraries']:
+            for day in itinerary.get('places', []):
+                for place in day:
+                    distance = geodesic((place['latitude'], place['longitude']), (latitude, longitude)).km
+                    if distance <= 1:
+                        nearby_places.append(place)
+
+        return jsonify(nearby_places), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+#打卡功能
+@app.route('/checkin', methods=['POST'])
 def checkin():
     data = request.get_json()
     latitude = data.get('latitude')
     longitude = data.get('longitude')
     timestamp = data.get('timestamp')
     user_profile = data.get('userProfile')
-    checkin_name = data.get('checkinName', '未命名')  # 預設為“未命名”
-
-    print('Received check-in data:', data)
+    checkin_name = data.get('checkinName', '未命名')  # 使用傳遞過来的 checkinName 或默認值
+    selected_place_id = data.get('selectedPlaceId', None)
 
     if not all([latitude, longitude, timestamp, user_profile]):
         return jsonify({"error": "Missing data"}), 400
 
-    checkin_id = str(uuid.uuid4())  # 生成唯一的 checkinId
+    checkin_id = str(uuid.uuid4())
     utc_time = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%fZ')
     local_tz = pytz.timezone('Asia/Taipei')
     local_time = utc_time.replace(tzinfo=pytz.utc).astimezone(local_tz)
@@ -631,58 +668,119 @@ def checkin():
 
     checkin_record = {
         "checkinId": checkin_id,
+        "checkinName": checkin_name,  # 使用傳遞過来的 checkinName
         "latitude": latitude,
         "longitude": longitude,
         "timestamp": local_time_str,
-        "checkinName": checkin_name  # 增加 checkinName 字段
+        "photos": [],
+        "description": "",
+        "palseCheckin": False  # 默認为 False
     }
 
     try:
-        checkins_collection.update_one(
+        # 先保存打卡紀錄
+        users.update_one(
             {"_id": user_profile["userId"]},
-            {
-                "$set": {
-                    "displayName": user_profile["displayName"],
-                    "pictureUrl": user_profile["pictureUrl"]
-                },
-                "$push": {
-                    "checkins": checkin_record
-                }
-            },
+            {"$push": {"checkins": checkin_record}},
             upsert=True
         )
-        print('Check-in data saved to MongoDB')
-        return jsonify({"checkinId": checkin_id}), 200  # 返回 checkinId
+
+        
+        # 檢查並更新最近的在1公里以內的地點的 `visited` 屬性
+        user = users.find_one({"_id": user_profile["userId"]})
+        if user and 'itineraries' in user:
+            if selected_place_id:
+                for itinerary in user['itineraries']:
+                    for day in itinerary.get('places', []):
+                        for place in day:
+                            if place['place_id'] == selected_place_id:
+                                place['visited'] = True
+                                users.update_one(
+                                    {"_id": user_profile["userId"], "itineraries.itinerary_id": itinerary["itinerary_id"]},
+                                    {"$set": {f"itineraries.$.places": itinerary['places']}}
+                                )
+                                checkin_record['palseCheckin'] = True
+                                users.update_one(
+                                    {"_id": user_profile["userId"], "checkins.checkinId": checkin_id},
+                                    {"$set": {"checkins.$.palseCheckin": True}}
+                                )
+
+        return jsonify({"checkinId": checkin_id, "palseCheckin": checkin_record['palseCheckin']}), 200
     except Exception as e:
-        print('Error inserting data into MongoDB:', e)
         return jsonify({"error": str(e)}), 500
 
-@app.route('/fetch_checkins', methods=['POST'])#2
+
+
+@app.route('/fetch_checkins', methods=['POST'])  #修改取回打卡數據API，只返回當前用戶的數據
 def fetch_checkins():
+    user_profile = request.get_json().get('userProfile')
+    if not user_profile:
+        return jsonify({"error": "Missing user profile"}), 400
+
     try:
-        checkins = list(checkins_collection.find({}, {'_id': 0}))
-        print('Checkins data:', checkins)
-        return jsonify(checkins), 200
+        user_checkins = users.find_one({"_id": user_profile["userId"]}, {"_id": 0, "checkins": 1})
+        if user_checkins and "checkins" in user_checkins:
+            return jsonify(user_checkins["checkins"]), 200
+        else:
+            return jsonify([]), 200
     except Exception as e:
-        print('Error fetching check-ins:', e)
         return jsonify({"error": str(e)}), 500
 
-@app.route('/checkins', methods=['DELETE'])#3
-def delete_checkins():
+@app.route('/delete_checkin', methods=['POST'])
+def delete_checkin():
+    data = request.json
+    checkin_id = data.get('checkinId')
+
+    if not checkin_id:
+        return jsonify({"error": "Missing checkinId"}), 400
+
     try:
-        result = checkins_collection.delete_many({})
-        if result.deleted_count > 0:
-            return jsonify({"message": "All check-ins deleted successfully"}), 200
+        user_checkin = users.find_one({'checkins.checkinId': checkin_id})
+        if not user_checkin:
+            return jsonify({'error': 'Checkin not found'}), 404
+
+        checkin = next((item for item in user_checkin['checkins'] if item['checkinId'] == checkin_id), None)
+        if checkin:
+            palseCheckin = checkin.get('palseCheckin', False)
+
+            # 删除 Google Cloud Storage 中的文件
+            if 'photos' in checkin:
+                for photo_url in checkin['photos']:
+                    blob_name = photo_url.split(f"https://storage.googleapis.com/{bucket_name}/")[-1]
+                    blob = bucket.blob(blob_name)
+                    blob.delete()
+            # 從用戶的checkins列表中刪除此打卡記錄
+            users.update_one(
+                {'checkins.checkinId': checkin_id},
+                {'$pull': {'checkins': {'checkinId': checkin_id}}}
+            )
+
+            if palseCheckin:
+                user = users.find_one({"_id": user_checkin["_id"]})
+                if user and 'itineraries' in user:
+                    for itinerary in user['itineraries']:
+                        for day in itinerary.get('places', []):
+                            for place in day:
+                                if place['latitude'] == checkin['latitude'] and place['longitude'] == checkin['longitude']:
+                                    place['visited'] = False
+                                    users.update_one(
+                                        {"_id": user["_id"], "itineraries.itinerary_id": itinerary["itinerary_id"]},
+                                        {"$set": {f"itineraries.$.places": itinerary['places']}}
+                                    )
+                                    break
+
+            return jsonify({'status': 'success', 'message': 'Check-in deleted successfully'}), 200
         else:
-            return jsonify({"error": "No check-ins found to delete"}), 404
+            return jsonify({'error': 'Checkin not found'}), 404
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/checkin/<checkin_id>', methods=['POST'])  # 確保允許 POST 方法#4
 def get_checkin(checkin_id):
     try:
         # 根據 checkin_id 查找打卡記錄
-        user_checkin = checkins_collection.find_one({'checkins.checkinId': checkin_id}, {'checkins.$': 1})
+        user_checkin = users.find_one({'checkins.checkinId': checkin_id}, {'checkins.$': 1})
         if user_checkin and 'checkins' in user_checkin and user_checkin['checkins']:
             checkin = user_checkin['checkins'][0]
             return jsonify(checkin), 200
@@ -692,17 +790,173 @@ def get_checkin(checkin_id):
         app.logger.error('Error fetching check-in details: %s', e)
         return jsonify({'error': str(e)}), 500
 
+@app.route('/update_checkin', methods=['POST'])
+def update_checkin():
+    data = request.form
+    checkin_id = data.get('checkinId')
+    checkin_name = data.get('checkinName')
+    description = data.get('description')
+    photos = request.files.getlist('photos')  # 處理多張照片
+    user_id = data.get('userId')
 
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=event.message.text)]
+    if not checkin_id:
+        return jsonify({"error": "Missing checkinId"}), 400
+
+    update_data = {}
+    if checkin_name:
+        update_data["checkins.$.checkinName"] = checkin_name
+    if description:
+        update_data["checkins.$.description"] = description
+
+    # 檢查現有照片數量
+    user_checkin = users.find_one({"checkins.checkinId": checkin_id}, {"checkins.$": 1})
+    if user_checkin and 'checkins' in user_checkin and user_checkin['checkins']:
+        existing_photos = user_checkin['checkins'][0].get('photos', [])
+        if len(existing_photos) + len(photos) > 9:
+            return jsonify({"error": "最多只能上傳9張照片"}), 400
+
+    photo_urls = []
+    for photo in photos:
+        photo_filename = f"{checkin_id}_{photo.filename}"
+        folder_path = f"{user_id}/{checkin_id}/"
+        blob = bucket.blob(f"{folder_path}{photo_filename}")
+        blob.upload_from_file(photo, content_type=photo.content_type)
+        photo_url = f"https://storage.googleapis.com/{bucket_name}/{folder_path}{photo_filename}"
+        photo_urls.append(photo_url)
+
+    try:
+        if photo_urls:
+            result = users.update_one(
+                {"checkins.checkinId": checkin_id},
+                {
+                    "$set": update_data,
+                    "$push": {"checkins.$.photos": {"$each": photo_urls}}  # 使用 $push 和 $each 追加多張照片
+                }
             )
+        else:
+            result = users.update_one(
+                {"checkins.checkinId": checkin_id},
+                {"$set": update_data}
+            )
+        if result.matched_count > 0:
+            return jsonify({"message": "Checkin updated successfully"}), 200
+        else:
+            return jsonify({"error": "Checkin not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/update_photo_order', methods=['POST'])
+def update_photo_order():
+    data = request.json
+    checkin_id = data.get('checkinId')
+    photo_order = data.get('photoOrder')
+
+    if not all([checkin_id, photo_order]):
+        return jsonify({'status': 'error', 'message': '缺少必要的字段'}), 400
+
+    try:
+        result = users.update_one(
+            {"checkins.checkinId": checkin_id},
+            {"$set": {"checkins.$.photos": [photo['url'] for photo in photo_order]}}
         )
+        if result.matched_count > 0:
+            return jsonify({'status': 'success'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': '打卡記錄未找到'}), 404
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+    
+@app.route('/set_homepage_photo', methods=['POST'])
+def set_homepage_photo():
+    data = request.json
+    checkin_id = data.get('checkinId')
+    photo_url = data.get('photoUrl')
+
+    if not checkin_id or not photo_url:
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        user_checkin = users.find_one({'checkins.checkinId': checkin_id})
+        if not user_checkin:
+            return jsonify({'error': 'Checkin not found'}), 404
+
+        checkin = next((item for item in user_checkin['checkins'] if item['checkinId'] == checkin_id), None)
+        if checkin:
+            photos = checkin.get('photos', [])
+            if not photos:
+                return jsonify({'error': 'No photos found in checkin'}), 404
+
+            if photo_url not in photos:
+                return jsonify({'error': 'Photo not found in checkin'}), 404
+
+            first_photo = photos[0]
+            index = photos.index(photo_url)
+            photos[0], photos[index] = photos[index], photos[0]
+
+            users.update_one(
+                {'checkins.checkinId': checkin_id},
+                {'$set': {'checkins.$.photos': photos}}
+            )
+
+            return jsonify({'message': 'Homepage photo set successfully'}), 200
+        else:
+            return jsonify({'error': 'Checkin not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/delete_photo', methods=['POST'])
+def delete_photo():
+    data = request.json
+    checkin_id = data.get('checkinId')
+    photo_url = data.get('photoUrl')
+
+    if not checkin_id or not photo_url:
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        user_checkin = users.find_one({'checkins.checkinId': checkin_id})
+        if not user_checkin:
+            return jsonify({'error': 'Checkin not found'}), 404
+
+        checkin = next((item for item in user_checkin['checkins'] if item['checkinId'] == checkin_id), None)
+        if checkin:
+            if 'photos' in checkin and photo_url in checkin['photos']:
+                checkin['photos'].remove(photo_url)
+                users.update_one(
+                    {'checkins.checkinId': checkin_id},
+                    {'$set': {'checkins.$.photos': checkin['photos']}}
+                )
+
+                # 删除 Google Cloud Storage 中的文件
+                blob_name = photo_url.split(f"https://storage.googleapis.com/{bucket_name}/")[-1]
+                blob = bucket.blob(blob_name)
+                blob.delete()
+
+                return jsonify({'message': 'Photo deleted successfully'}), 200
+            else:
+                return jsonify({'error': 'Photo not found in checkin'}), 404
+        else:
+            return jsonify({'error': 'Checkin not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/proxy_google_places', methods=['POST'])
+def proxy_google_places():
+    data = request.json
+    place_id = data.get('place_id')
+    api_key = data.get('key')
+
+    if not place_id or not api_key:
+        return jsonify({'status': 'error', 'message': 'Missing required parameters'}), 400
+
+    google_places_url = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&key={api_key}&language=zh-TW"
+
+    try:
+        response = requests.get(google_places_url)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 # ------------------------------------------------------------------------------ raman part
 
 if __name__ == '__main__':
