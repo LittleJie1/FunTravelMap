@@ -1,0 +1,112 @@
+{
+  "type": "bubble",
+  "body": {
+    "type": "box",
+    "layout": "vertical",
+    "contents": [
+      {
+        "type": "text",
+        "text": "${city} ${town} 天氣資訊",
+        "weight": "bold",
+        "size": "xl",
+        "color": "#AE0000"
+      },
+      {
+        "type": "separator",
+        "margin": "md"
+      },
+      {
+        "type": "box",
+        "layout": "vertical",
+        "margin": "lg",
+        "spacing": "sm",
+        "contents": [
+          {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+              {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                  {
+                    "type": "text",
+                    "text": "天氣",
+                    "color": "#aaaaaa",
+                    "size": "sm",
+                    "flex": 1
+                  },
+                  {
+                    "type": "text",
+                    "text": "${weather}",
+                    "wrap": true,
+                    "color": "#666666",
+                    "size": "sm",
+                    "flex": 3
+                  }
+                ]
+              },
+              {
+                "type": "image",
+                "url": "${icon_url}",
+                "size": "sm",
+                "aspectRatio": "1:1",
+                "aspectMode": "cover"
+              }
+            ]
+          },
+          {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+              {
+                "type": "text",
+                "text": "氣溫",
+                "color": "#aaaaaa",
+                "size": "sm",
+                "flex": 1
+              },
+              {
+                "type": "text",
+                "text": "${temperature}°C",
+                "wrap": true,
+                "color": "#666666",
+                "size": "sm",
+                "flex": 3
+              }
+            ]
+          },
+          {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+              {
+                "type": "text",
+                "text": "降雨量",
+                "color": "#aaaaaa",
+                "size": "sm",
+                "flex": 1
+              },
+              {
+                "type": "text",
+                "text": "${rainfall} mm",
+                "wrap": true,
+                "color": "#666666",
+                "size": "sm",
+                "flex": 3
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "styles": {
+    "body": {
+      "backgroundColor": "#FFF5EE"
+    }
+  }
+}

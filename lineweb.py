@@ -3,7 +3,6 @@ from flask_cors import CORS
 import json
 from time import strftime
 from pymongo.mongo_client import MongoClient
-import itertools
 import requests  
 import uuid
 import pytz
@@ -12,7 +11,6 @@ import os
 from geopy.distance import geodesic
 from google.cloud import storage
 from vertexai.preview.generative_models import GenerativeModel
-import time
 from datetime import datetime
 from linebot.v3 import (
     WebhookHandler
@@ -25,13 +23,25 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
-    TextMessage
+    TextMessage,
+    FlexMessage,
+    FlexContainer
 )
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
     FollowEvent,
     UnfollowEvent,
+    LocationMessageContent
+)
+from utils import (
+    get_nearest_station,
+    calculate_distance_matrix,
+    extract_distances,
+    find_best_route,
+    get_places_by_city,
+    filter_high_rated_places,
+    is_nearby
 )
 
 app = Flask(__name__)
@@ -43,6 +53,20 @@ with open('env.json') as f:
 
 configuration = Configuration(access_token=env['CHANNEL_ACCESS_TOKEN'])
 handler = WebhookHandler(env['CHANNEL_SECRET'])
+
+api_key = env['API_KEY']
+weather_url = f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization={api_key}"
+
+icon_base_url = "https://storage.googleapis.com/funtravelmap/weather_icon/"
+weather_icons = {
+    "晴": "sun.png",
+    "多雲": "clouds.png",
+    "陰": "cloudy.png",
+    "多雲有雨": "rain.png",
+    "陰有雷": "storm.png",
+    "陰有雨": "rain_cloudy.png",
+    "陰有雷雨": "rain_thunder.png"
+}
 
 # 設置 MongoDB 連接
 mongo_client = MongoClient(env['MONGODB_URI'])
@@ -140,6 +164,47 @@ def handle_unfollow(event):
         {"_id": userid},
         {"$set": {"unfollow": strftime('%Y/%m/%d-%H:%M:%S')}}
     )
+# ---------------------------------------------------------------      weather
+@handler.add(MessageEvent, message=LocationMessageContent)
+def handle_location_message(event):
+    latitude = event.message.latitude
+    longitude = event.message.longitude
+    weather_info = get_nearest_station(latitude, longitude, weather_url)
+    
+    if isinstance(weather_info, dict):
+        weather = weather_info['天氣']
+        icon_filename = weather_icons.get(weather, "default.png")
+        icon_url = f"{icon_base_url}{icon_filename}"
+
+        with open('flex_message_template.json', encoding='utf-8') as f:
+            flex_template = json.load(f)
+
+        flex_template_str = json.dumps(flex_template)
+        flex_template_str = flex_template_str.replace("${city}", weather_info['縣市'])
+        flex_template_str = flex_template_str.replace("${town}", weather_info['鄉鎮'])
+        flex_template_str = flex_template_str.replace("${weather}", weather)
+        flex_template_str = flex_template_str.replace("${icon_url}", icon_url)
+        flex_template_str = flex_template_str.replace("${temperature}", str(weather_info['氣溫']))
+        flex_template_str = flex_template_str.replace("${rainfall}", str(weather_info['降雨量']))
+        flex_template = json.loads(flex_template_str)
+
+        msg = FlexMessage(
+            alt_text="天氣資訊",
+            contents=FlexContainer.from_json(json.dumps(flex_template))
+        )
+    else:
+        msg = TextMessage(text=weather_info)
+        
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[msg]
+            )
+        )
+
+# ---------------------------------------------------------------     weather
 
 @app.route('/get_itineraries', methods=['POST']) #-------------------------查看行程
 def get_itineraries():
@@ -402,7 +467,7 @@ def optimize_route():
     origins = '|'.join([f"{place['latitude']},{place['longitude']}" for place in places])
 
     try:
-        response_data = calculate_distance_matrix(origins)
+        response_data = calculate_distance_matrix(origins, GOOGLE_MAPS_API_KEY)
         if response_data['status'] != 'OK':
             return jsonify({'status': 'error', 'message': 'Google API錯誤'}), 500
 
@@ -419,50 +484,6 @@ def optimize_route():
     except Exception as e:
         print(f'優化路徑時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'優化路徑時發生錯誤: {str(e)}'}), 500
-    
-def calculate_distance_matrix(origins): #-----------------------------------計算景點之間距離矩陣
-    url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins}&destinations={origins}&key={GOOGLE_MAPS_API_KEY}"
-    response = requests.get(url)
-    response_data = response.json()
-    return response_data
-
-def extract_distances(response_data): #-----------------------------------提取距離矩陣
-    distances = []
-    for row in response_data['rows']:
-        distances.append([element['distance']['value'] for element in row['elements']])
-    return distances
-
-def find_best_route(distances, places): #-----------------------------------計算查找最佳路線
-    num_places = len(places)  # 獲取地點數量
-    indices = list(range(num_places))  # 創建一個地點索引的列表 [0, 1, 2, ...]
-    min_distance = float('inf')  # 初始化最小距離為正無窮大
-    best_permutation = indices  # 初始化最佳排列為地點的原始順序
-    cache = {}  # 初始化一個字典用來緩存計算過的排列組合的總距離
-
-    def calculate_total_distance(permutation):
-        # 如果該排列組合的距離已經計算過，直接從緩存中獲取
-        if permutation in cache:
-            return cache[permutation]
-        
-        # 計算該排列組合的總距離
-        total_distance = sum(distances[permutation[i]][permutation[i+1]] for i in range(len(permutation) - 1))
-        
-        # 將計算結果存入緩存中
-        cache[permutation] = total_distance
-        return total_distance
-
-    # 遍歷所有地點的所有排列組合
-    for permutation in itertools.permutations(indices):
-        total_distance = calculate_total_distance(permutation)  # 計算當前排列的總距離
-        
-        # 如果當前排列的總距離小於已知最小距離，則更新最小距離和最佳排列
-        if total_distance < min_distance:
-            min_distance = total_distance
-            best_permutation = permutation
-
-    # 根據最佳排列重新排序地點
-    sorted_places = [places[i] for i in best_permutation]
-    return sorted_places
 
 @app.route('/update_place_order', methods=['POST'])# ------------------------------------------拖曳方式移動景點順序
 def update_place_order():
@@ -506,7 +527,7 @@ def process_city_selection():
     try:
         # 查詢指定縣市的景點
         print("查詢指定縣市的景點")
-        places = get_places_by_city(city_name, place_type='tourist_attraction')
+        places = get_places_by_city(gmaps, city_name)
         high_rated_places = filter_high_rated_places(places)
         print(f"查詢結果: {len(high_rated_places)} 個高評價景點")
 
@@ -549,7 +570,7 @@ def process_city_selection():
             # 調用最佳路線計算
             print("調用最佳路線計算")
             origins = '|'.join([f"{place['latitude']},{place['longitude']}" for place in gemini_response])
-            response_data = calculate_distance_matrix(origins)
+            response_data = calculate_distance_matrix(origins, GOOGLE_MAPS_API_KEY)
             if response_data['status'] != 'OK':
                 print(f"Google API 錯誤: {response_data['status']}")
                 return jsonify({'status': 'error', 'message': 'Google API錯誤'}), 500
@@ -580,44 +601,7 @@ def process_city_selection():
         print(f'處理縣市選擇時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'處理縣市選擇時發生錯誤: {str(e)}'}), 500
     
-# 查詢函數
-def get_places_by_city(city_name, place_type='tourist_attraction', language='zh-TW', max_places=30):
-    try:
-        query = f'{place_type} in {city_name}'
-        places_result = gmaps.places(query=query, language=language)
-        places = places_result['results']
-        total_places = len(places)
-        
-        while 'next_page_token' in places_result and total_places < max_places:
-            next_page_token = places_result['next_page_token']
-            time.sleep(2)
-            places_result = gmaps.places(query=query, language=language, page_token=next_page_token)
-            places.extend(places_result['results'])
-            total_places = len(places)
-            if total_places >= max_places:
-                places = places[:max_places]
-                break
-        
-        return places
-    
-    except Exception as e:
-        print(f"Error in get_places_by_city: {e}")
-        return []
-
-# 過濾函數
-def filter_high_rated_places(places, min_rating=4.0):
-    try:
-        high_rated_places = [place for place in places if place.get('rating', 0) >= min_rating]
-        return high_rated_places
-    except Exception as e:
-        print(f"Error in filter_high_rated_places: {e}")
-        return []
 # ------------------------------------------------------------------------------ raman part
-def is_nearby(place_lat, place_lng, checkin_lat, checkin_lng, distance_km=1):
-    place_coords = (place_lat, place_lng)
-    checkin_coords = (checkin_lat, checkin_lng)
-    return geodesic(place_coords, checkin_coords).km <= distance_km
-
 # 添加在 checkin 函數之前，定義一個函數，用於檢查用戶是否已經在某個地點打卡
 @app.route('/check_nearby_places', methods=['POST'])
 def check_nearby_places():
