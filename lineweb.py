@@ -102,7 +102,7 @@ gcs_client = storage.Client()
 bucket_name = 'funtravelmap' # 你的存儲桶名稱
 bucket = gcs_client.bucket(bucket_name)
 
-@app.route("/callback", methods=['POST'])
+@app.route("/api/callback", methods=['POST'])
 def callback():
     # get X-Line-Signature header value
     signature = request.headers['X-Line-Signature']
@@ -206,7 +206,7 @@ def handle_location_message(event):
 
 # ---------------------------------------------------------------     weather
 
-@app.route('/get_itineraries', methods=['POST']) #-------------------------查看行程
+@app.route('/api/get_itineraries', methods=['POST']) #-------------------------查看行程
 def get_itineraries():
     user_id = request.json.get('user_id')
     
@@ -225,7 +225,7 @@ def get_itineraries():
         return jsonify({'status': 'error', 'message': f'獲取使用者行程時發生錯誤: {str(e)}'}), 500
 
 
-@app.route('/add_itinerary', methods=['POST'])  # -------------------------新建行程
+@app.route('/api/add_itinerary', methods=['POST'])  # -------------------------新建行程
 def add_itinerary():
     data = request.json
     user_id = data.get('user_id')
@@ -263,7 +263,7 @@ def add_itinerary():
     else:
         return jsonify({'status': 'error', 'message': 'Failed to add itinerary'}), 500
     
-@app.route('/delete_itinerary', methods=['POST']) #--------------------刪除行程
+@app.route('/api/delete_itinerary', methods=['POST']) #--------------------刪除行程
 def delete_itinerary():
     user_id = request.json.get('user_id')
     itinerary_id = request.json.get('itinerary_id')
@@ -285,7 +285,7 @@ def delete_itinerary():
         print(f'刪除行程時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'刪除行程時發生錯誤: {str(e)}'}), 500
     
-@app.route('/add_place', methods=['POST'])  # --------------------加入行程
+@app.route('/api/add_place', methods=['POST'])  # --------------------加入行程
 def add_place():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -327,7 +327,7 @@ def add_place():
         print(f'添加地點時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'添加地點時發生錯誤: {str(e)}'}), 500
     
-@app.route('/remove_day', methods=['POST']) # --------------------減天數
+@app.route('/api/remove_day', methods=['POST']) # --------------------減天數
 def remove_day():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -353,7 +353,7 @@ def remove_day():
         print(f'刪除天數時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'刪除天數時發生錯誤: {str(e)}'}), 500
     
-@app.route('/add_day', methods=['POST']) # ------------------------加天數
+@app.route('/api/add_day', methods=['POST']) # ------------------------加天數
 def add_day():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -375,7 +375,7 @@ def add_day():
         print(f'添加天數時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'添加天數時發生錯誤: {str(e)}'}), 500
 
-@app.route('/move_place', methods=['POST'])  # --------------------移動景點順序
+@app.route('/api/move_place', methods=['POST'])  # --------------------移動景點順序
 def move_place():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -411,7 +411,7 @@ def move_place():
         print(f'移動地點時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'移動地點時發生錯誤: {str(e)}'}), 500
 
-@app.route('/delete_place', methods=['POST'])  # --------------------移動景點順序
+@app.route('/api/delete_place', methods=['POST'])  # --------------------移動景點順序
 def delete_place():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -445,7 +445,7 @@ def delete_place():
         return jsonify({'status': 'error', 'message': f'刪除地點時發生錯誤: {str(e)}'}), 500
     
  
-@app.route('/optimize_route', methods=['POST']) # ------------------------------------------實現最短路徑按鈕
+@app.route('/api/optimize_route', methods=['POST']) # ------------------------------------------實現最短路徑按鈕
 def optimize_route():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -485,7 +485,7 @@ def optimize_route():
         print(f'優化路徑時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'優化路徑時發生錯誤: {str(e)}'}), 500
 
-@app.route('/update_place_order', methods=['POST'])# ------------------------------------------拖曳方式移動景點順序
+@app.route('/api/update_place_order', methods=['POST'])# ------------------------------------------拖曳方式移動景點順序
 def update_place_order():
     data = request.json
     itinerary_id = data.get('itinerary_id')
@@ -514,7 +514,7 @@ def update_place_order():
         print(f'更新地點順序時發生錯誤: {e}')
         return jsonify({'status': 'error', 'message': f'更新地點順序時發生錯誤: {str(e)}'}), 500
     
-@app.route('/process_city_selection', methods=['POST'])# ------------------------------------------智能推薦景點
+@app.route('/api/process_city_selection', methods=['POST'])# ------------------------------------------智能推薦景點
 def process_city_selection():
     data = request.json
     city_name = data.get('city_name')
@@ -603,7 +603,7 @@ def process_city_selection():
     
 # ------------------------------------------------------------------------------ raman part
 # 添加在 checkin 函數之前，定義一個函數，用於檢查用戶是否已經在某個地點打卡
-@app.route('/check_nearby_places', methods=['POST'])
+@app.route('/api/check_nearby_places', methods=['POST'])
 def check_nearby_places():
     data = request.get_json()
     latitude = data.get('latitude')
@@ -631,7 +631,7 @@ def check_nearby_places():
         return jsonify({"error": str(e)}), 500
     
 #打卡功能
-@app.route('/checkin', methods=['POST'])
+@app.route('/api/checkin', methods=['POST'])
 def checkin():
     data = request.get_json()
     latitude = data.get('latitude')
@@ -695,7 +695,7 @@ def checkin():
 
 
 
-@app.route('/fetch_checkins', methods=['POST'])  #修改取回打卡數據API，只返回當前用戶的數據
+@app.route('/api/fetch_checkins', methods=['POST'])  #修改取回打卡數據API，只返回當前用戶的數據
 def fetch_checkins():
     user_profile = request.get_json().get('userProfile')
     if not user_profile:
@@ -710,7 +710,7 @@ def fetch_checkins():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/delete_checkin', methods=['POST'])
+@app.route('/api/delete_checkin', methods=['POST'])
 def delete_checkin():
     data = request.json
     checkin_id = data.get('checkinId')
@@ -760,7 +760,7 @@ def delete_checkin():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/checkin/<checkin_id>', methods=['POST'])  # 確保允許 POST 方法#4
+@app.route('/api/checkin/<checkin_id>', methods=['POST'])  # 確保允許 POST 方法#4
 def get_checkin(checkin_id):
     try:
         # 根據 checkin_id 查找打卡記錄
@@ -774,7 +774,7 @@ def get_checkin(checkin_id):
         app.logger.error('Error fetching check-in details: %s', e)
         return jsonify({'error': str(e)}), 500
 
-@app.route('/update_checkin', methods=['POST'])
+@app.route('/api/update_checkin', methods=['POST'])
 def update_checkin():
     data = request.form
     checkin_id = data.get('checkinId')
@@ -829,7 +829,7 @@ def update_checkin():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-@app.route('/update_photo_order', methods=['POST'])
+@app.route('/api/update_photo_order', methods=['POST'])
 def update_photo_order():
     data = request.json
     checkin_id = data.get('checkinId')
@@ -850,7 +850,7 @@ def update_photo_order():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
     
-@app.route('/set_homepage_photo', methods=['POST'])
+@app.route('/api/set_homepage_photo', methods=['POST'])
 def set_homepage_photo():
     data = request.json
     checkin_id = data.get('checkinId')
@@ -889,7 +889,7 @@ def set_homepage_photo():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/delete_photo', methods=['POST'])
+@app.route('/api/delete_photo', methods=['POST'])
 def delete_photo():
     data = request.json
     checkin_id = data.get('checkinId')
@@ -925,7 +925,7 @@ def delete_photo():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/proxy_google_places', methods=['POST'])
+@app.route('/api/proxy_google_places', methods=['POST'])
 def proxy_google_places():
     data = request.json
     place_id = data.get('place_id')
